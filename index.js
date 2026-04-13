@@ -11,7 +11,7 @@ import qrcode from "qrcode";
 import { existsSync, rmSync } from "fs";
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "50mb" }));
 
 const PORT = process.env.PORT || 3000;
 const BACKEND_TOKEN = process.env.BACKEND_TOKEN || "meu-token-secreto";
@@ -84,6 +84,40 @@ async function startSession() {
   });
 }
 
+// ── Helper: monta conteúdo da mensagem por tipo ──────────────────────────────
+function buildMessageContent(type, message, mediaUrl) {
+  const t = (type || "texto").toLowerCase();
+
+  if (t === "imagem" || t === "image") {
+    return { image: { url: mediaUrl }, caption: message || "" };
+  }
+
+  if (t === "video") {
+    return { video: { url: mediaUrl }, caption: message || "" };
+  }
+
+  if (t === "audio") {
+    // ptt = true envia como nota de voz (ícone de microfone)
+    return {
+      audio: { url: mediaUrl },
+      mimetype: "audio/ogg; codecs=opus",
+      ptt: true,
+    };
+  }
+
+  if (t === "documento" || t === "document") {
+    const fileName = mediaUrl.split("/").pop() || "arquivo";
+    return {
+      document: { url: mediaUrl },
+      mimetype: "application/octet-stream",
+      fileName,
+    };
+  }
+
+  // texto (padrão)
+  return { text: message };
+}
+
 // ── Rotas ────────────────────────────────────────────────────────────────────
 
 // Healthcheck público
@@ -148,28 +182,35 @@ app.post("/stop", auth, async (req, res) => {
   }
 });
 
-// POST /send — envia mensagem de texto
+// POST /send — envia mensagem (texto, imagem, vídeo, áudio, documento)
+//   Body: { to, message, type?, mediaUrl? }
+//   type: "texto" | "imagem" | "video" | "audio" | "documento"
 app.post("/send", auth, async (req, res) => {
-  const { to, message } = req.body;
+  const { to, message, type = "texto", mediaUrl } = req.body;
 
-  if (!to || !message) {
-    return res.status(400).json({ error: "Campos 'to' e 'message' são obrigatórios" });
+  if (!to) {
+    return res.status(400).json({ error: "Campo 'to' é obrigatório" });
+  }
+  if (!message && !mediaUrl) {
+    return res.status(400).json({ error: "Informe 'message' ou 'mediaUrl'" });
   }
   if (connectionStatus !== "conectado") {
     return res.status(503).json({ error: "WhatsApp não está conectado" });
   }
 
   try {
-    // Normaliza número: só dígitos + @s.whatsapp.net
     const jid = to.includes("@") ? to : `${to.replace(/\D/g, "")}@s.whatsapp.net`;
-    await sock.sendMessage(jid, { text: message });
-    res.json({ status: "enviado", to: jid });
+    const content = buildMessageContent(type, message, mediaUrl);
+    await sock.sendMessage(jid, content);
+    res.json({ status: "enviado", to: jid, type });
   } catch (err) {
+    console.error("Erro ao enviar:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// POST /send-bulk — envia em massa (array de { to, message })
+// POST /send-bulk — envia em massa
+//   Body: { messages: [{ to, message, type?, mediaUrl? }], delay? }
 app.post("/send-bulk", auth, async (req, res) => {
   const { messages, delay = 1500 } = req.body;
 
@@ -181,11 +222,12 @@ app.post("/send-bulk", auth, async (req, res) => {
   }
 
   const results = [];
-  for (const { to, message } of messages) {
+  for (const { to, message, type = "texto", mediaUrl } of messages) {
     try {
       const jid = to.includes("@") ? to : `${to.replace(/\D/g, "")}@s.whatsapp.net`;
-      await sock.sendMessage(jid, { text: message });
-      results.push({ to, status: "enviado" });
+      const content = buildMessageContent(type, message, mediaUrl);
+      await sock.sendMessage(jid, content);
+      results.push({ to, status: "enviado", type });
     } catch (err) {
       results.push({ to, status: "erro", error: err.message });
     }
